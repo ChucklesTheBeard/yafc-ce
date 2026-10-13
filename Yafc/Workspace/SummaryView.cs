@@ -162,6 +162,7 @@ public class SummaryView : ProjectPageView<Summary> {
     private readonly HashSet<ProjectPage> subscribedPages = [];
 
     private Dictionary<string, GoodDetails> allGoods = [];
+    private float cubeOccupancy;
 
     private IEnumerable<(string name, GoodDetails details, bool enoughProduced)> GoodsToDisplay() {
         foreach (KeyValuePair<string, GoodDetails> goodInfo in allGoods) {
@@ -297,6 +298,12 @@ public class SummaryView : ProjectPageView<Summary> {
                     await AutoBalance();
                 }
             }
+
+            if (cubeOccupancy > Epsilon) {
+                using (gui.EnterRowWithHelpIcon(LSs.SummaryCubeOccupancyHint, false)) {
+                    gui.BuildText($"{LSs.SummaryCubeOccupancy.L()}: {DataUtils.FormatAmount(cubeOccupancy, UnitOfMeasure.Percent)}");
+                }
+            }
         }
         gui.AllocateSpacing();
 
@@ -391,6 +398,15 @@ public class SummaryView : ProjectPageView<Summary> {
         }
     }
 
+    /// <summary>
+    /// The item names of the singleton Ultradense Utility Cube from the Ultracube mod, in both its active and dormant forms.
+    /// </summary>
+    private static readonly HashSet<string> CubeNames = ["cube-ultradense-utility-cube", "cube-dormant-utility-cube"];
+
+    private static bool RowUsesCube(RecipeRow row) =>
+        row.fuel is not null && CubeNames.Contains(row.fuel.target.name)
+        || (row.recipe?.target.ingredients.Any(i => CubeNames.Contains(i.goods.name)) ?? false);
+
     private IEnumerable<ProductionTable> DisplayTables => project.displayPages.Select(p => project.FindPage(p)?.content as ProductionTable).WhereNotNull();
     private IEnumerable<ProjectPage> DisplayPages => DisplayTables.Select(t => (ProjectPage)t.owner);
 
@@ -448,6 +464,15 @@ public class SummaryView : ProjectPageView<Summary> {
                         value.sum -= YafcRounding(flow.amount);
                         newGoods[flow.goods.QualityName()] = value;
                     }
+                }
+            }
+        }
+
+        cubeOccupancy = 0f;
+        foreach (ProductionTable table in DisplayTables) {
+            foreach (RecipeRow row in table.GetAllRecipes()) {
+                if (row.hierarchyEnabled && RowUsesCube(row)) {
+                    cubeOccupancy += row.buildingCount;
                 }
             }
         }
