@@ -335,7 +335,39 @@ public class SummaryView : ProjectPageView<Summary> {
     // SetProject can recalculate before SetModel attaches the persisted showOnlyIssues value, which affects column width.
     protected override void ModelContentsChanged(bool visualOnly) => Recalculate(visualOnly);
 
+    /// <summary>Maximum total time in milliseconds that Auto balance is allowed to keep re-running.</summary>
+    private const long AutoBalanceTimeoutMs = 1000;
+
     private async Task AutoBalance() {
+        // Keep running passes until the state stops changing (stable), or the overall budget runs out.
+        // Use a monotonic wall clock: this whole loop can run synchronously inside one main-loop tick, so Ui.time (which is
+        // only updated in ProcessEvents) may never advance and the deadline would never be reached.
+        long deadline = Environment.TickCount64 + AutoBalanceTimeoutMs;
+        while (true) {
+            // A pass that updates no links can still change the state (its final forced re-solve of the displayed pages can
+            // update them, which may create new work), so stability means the state itself is unchanged, not that the pass
+            // didn't touch any link.
+            Dictionary<string, GoodDetails> before = allGoods;
+            await AutoBalancePass(deadline);
+            if (SameGoods(before, allGoods) || Environment.TickCount64 >= deadline) {
+                break;
+            }
+        }
+    }
+
+    private static bool SameGoods(Dictionary<string, GoodDetails> a, Dictionary<string, GoodDetails> b) {
+        if (a.Count != b.Count) {
+            return false;
+        }
+        foreach (KeyValuePair<string, GoodDetails> entry in a) {
+            if (!b.TryGetValue(entry.Key, out GoodDetails value) || !EqualityComparer<GoodDetails>.Default.Equals(entry.Value, value)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private async Task AutoBalancePass(long deadline) {
         try {
             // The things we've already updated, and the error each had before their previous update.
             Queue<ProductionLink> updateOrder = [];
@@ -343,6 +375,9 @@ public class SummaryView : ProjectPageView<Summary> {
             int negativeFeedbackCount = 0;
 
             for (int i = 0; i < 1000; i++) { // No matter what else happens, give up after 1000 clicks.
+                if (Environment.TickCount64 >= deadline) {
+                    break;
+                }
                 float? oldExcess = null;
                 GoodDetails details;
                 float excess;
@@ -354,7 +389,9 @@ public class SummaryView : ProjectPageView<Summary> {
                         // Find the link
                         .Select(x => (x.details, x.excess, link: DisplayTables.Select(t => t.links.FirstOrDefault(l => l.goods.QualityName() == x.name && l.amount != 0)).WhereNotNull().SingleOrDefault(false)))
                         // Find an item with exactly one link that hasn't been updated yet. (Or has been removed to allow it to be updated again.)
-                        .FirstOrDefault(x => x.link != null && !previousUpdates.ContainsKey(x.link));
+                        // Never pick a link that is already at its target amount: 'updating' it is a no-op that only wastes the
+                        // negative-feedback budget and pokes the solve state for no reason.
+                        .FirstOrDefault(x => x.link != null && !previousUpdates.ContainsKey(x.link) && Math.Abs(x.details.sum - YafcRounding(x.link.amount)) >= Epsilon);
 
                     if (link != null) { break; }
 
@@ -390,10 +427,32 @@ public class SummaryView : ProjectPageView<Summary> {
         }
         finally {
             // HACK: Nothing left to change, but force a recalculate anyway, so the user doesn't have to view all the tabs before clicking Auto balance again.
-            // Sometimes this will cause updates that require an additional button click.
+            // Sometimes this will cause updates that require an additional pass.
             // This is probably related to https://github.com/Yafc-CE/yafc-ce/issues/169
-            foreach (ProjectPage page in DisplayPages) {
-                await page.RunSolveJob();
+            //
+            // The link updates made above are still pending in the undo batch: the app commits them only when the current
+            // gesture ends, which happens AFTER this whole loop. Until the commit, the touched pages don't even register as
+            // stale, so nothing gets solved and the stability check would measure the pre-update state — which is exactly
+            // why every follow-up round only happened on the user's next click. So settle the state now, in a loop:
+            //   1. FlushPendingChanges() commits the pending updates; that makes the touched pages stale and kicks off
+            //      background solves for the active ones.
+            //   2. A yield lets those solves run their main-thread continuations (the solver runs on a worker thread).
+            //   3. The sweep resolves any page that is (still) stale; solving one page can make another page stale again.
+            // Repeat until a round changes nothing. Each pass still commits as a single undo batch, so Ctrl-Z granularity
+            // is preserved.
+            bool settled = false;
+            while (!settled && Environment.TickCount64 < deadline) {
+                Dictionary<string, GoodDetails> before = allGoods;
+                project.undo.FlushPendingChanges();
+                await Task.Yield(); // let solves kicked off by the commit (or the sweep below) run their foreground continuations
+                bool resolvedAny = false;
+                foreach (ProjectPage page in DisplayPages) {
+                    if (page.IsSolutionStale()) {
+                        resolvedAny = true;
+                        await page.RunSolveJob();
+                    }
+                }
+                settled = !resolvedAny && SameGoods(before, allGoods);
             }
         }
     }
